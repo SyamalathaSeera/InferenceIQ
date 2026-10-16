@@ -17,7 +17,7 @@ from app.api.policies import router as policies_router
 from app.api.projects import router as projects_router
 from app.api.provider_health import router as provider_health_router
 from app.api.simulations import router as simulations_router
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.database import Database
 from app.inference.catalog import create_model_catalog
 from app.inference.engine import InferenceDecisionEngine
@@ -41,7 +41,7 @@ def _is_unsafe_production_secret(value: str | None, *, development_value: str) -
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    settings = get_settings()
+    settings = app.state.settings
     if settings.inferenceiq_auth_required and _is_unsafe_production_secret(
         settings.inferenceiq_admin_token,
         development_value="dev-admin-key",
@@ -76,14 +76,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await database.close()
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="InferenceIQ",
         version="0.1.0",
         description="An intelligent inference optimization and control platform",
         lifespan=lifespan,
     )
-    settings = get_settings()
+    settings = settings or get_settings()
+    app.state.settings = settings
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[

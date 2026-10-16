@@ -77,6 +77,7 @@ class OpenAIProvider(ChatProvider):
                 total_tokens=usage.total_tokens if usage else 0,
             ),
             provider=self.name,
+            metadata={"usage_available": usage is not None},
         )
 
     async def stream(

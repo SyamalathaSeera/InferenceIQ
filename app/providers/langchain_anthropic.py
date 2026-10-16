@@ -48,7 +48,9 @@ class LangChainAnthropicProvider(ChatProvider):
         model = self._model_factory(model_name)
 
         try:
-            response: AIMessage = await model.ainvoke(self._messages(request))
+            response: AIMessage = await model.ainvoke(
+                self._messages(request), **self._generation_parameters(request)
+            )
         except Exception as exc:
             # We will add granular cross-provider error classification later.
             raise ProviderError("The Anthropic request failed.") from exc
@@ -71,6 +73,11 @@ class LangChainAnthropicProvider(ChatProvider):
                 total_tokens=usage.get("total_tokens", 0),
             ),
             provider=self.name,
+            metadata={
+                "usage_available": (
+                    "input_tokens" in usage and "output_tokens" in usage
+                )
+            },
         )
 
     async def stream(
@@ -108,6 +115,17 @@ class LangChainAnthropicProvider(ChatProvider):
     def _model_name(self, requested_model: str | None) -> str:
         model = requested_model or self._default_model
         return model.removeprefix("anthropic/")
+
+    @staticmethod
+    def _generation_parameters(request: ChatCompletionRequest) -> dict:
+        return {
+            key: value
+            for key, value in {
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+            }.items()
+            if value is not None
+        }
 
     @staticmethod
     def _messages(request: ChatCompletionRequest) -> list[BaseMessage]:
