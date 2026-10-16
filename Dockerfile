@@ -1,4 +1,4 @@
-FROM node:22-alpine AS dashboard-build
+FROM node:25-alpine AS dashboard-build
 WORKDIR /build
 COPY dashboard/package.json dashboard/package-lock.json ./dashboard/
 RUN cd dashboard && npm ci
