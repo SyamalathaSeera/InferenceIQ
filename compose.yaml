@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: inferenceiq
+      POSTGRES_USER: inferenceiq
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - inferenceiq-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inferenceiq -d inferenceiq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &app-environment
+      DATABASE_URL: postgresql+asyncpg://inferenceiq:${POSTGRES_PASSWORD}@postgres:5432/inferenceiq
+      LANGGRAPH_CHECKPOINT_URL: postgresql://inferenceiq:${POSTGRES_PASSWORD}@postgres:5432/inferenceiq
+      AUTO_CREATE_SCHEMA: "false"
+      INFERENCEIQ_AUTH_REQUIRED: "true"
+      INFERENCEIQ_ADMIN_TOKEN: ${INFERENCEIQ_ADMIN_TOKEN:?Set INFERENCEIQ_ADMIN_TOKEN in .env}
+      INFERENCEIQ_AUDIT_SIGNING_KEY: ${INFERENCEIQ_AUDIT_SIGNING_KEY:?Set INFERENCEIQ_AUDIT_SIGNING_KEY in .env}
+      PROVIDER: ${PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OLLAMA_ENABLED: ${OLLAMA_ENABLED:-false}
+      INFERENCEIQ_LANGSMITH_ENABLED: ${INFERENCEIQ_LANGSMITH_ENABLED:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    environment: *app-environment
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  inferenceiq-postgres:

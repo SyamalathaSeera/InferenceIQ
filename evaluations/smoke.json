@@ -1,0 +1,17 @@
+[
+  {
+    "id": "mock-exact-response",
+    "messages": [
+      {"role": "user", "content": "Hello evaluation"}
+    ],
+    "expected_exact": "Mock response: Hello evaluation"
+  },
+  {
+    "id": "mock-required-content",
+    "messages": [
+      {"role": "user", "content": "Explain inference policies"}
+    ],
+    "required_substrings": ["inference", "policies"],
+    "forbidden_substrings": ["error"]
+  }
+]
