@@ -1,10 +1,15 @@
-# Routing benchmarks (Phase 1)
+# Routing, reliability, and quality benchmarks
 
 The existing evaluation CLI now benchmarks the actual non-streaming
 `POST /v1/chat/completions` route. Every fixed model and the automatic cost,
 latency, quality, and balanced policies receive the same dataset, repetitions,
 generation parameters, and attempt limit. Legacy single-provider evaluation
 commands continue to work.
+
+Verified mock result tables and a routing/fallback walkthrough are in the
+[README](../README.md#verified-mock-results). These are local simulations, not
+live-provider quality or performance evidence. Existing ignored reports are
+preserved; choose a new output filename for every run.
 
 ## Safe mock smoke run
 
@@ -48,8 +53,9 @@ to a real-provider server may incur charges; Phase 1 validation uses mocks only.
 .venv\Scripts\python.exe -m app.evaluation.cli --benchmark --base-url http://127.0.0.1:8000 --dataset evaluations/smoke.json --fixed-models mock/fast mock/quality --repetitions 3 --concurrency 2 --temperature 0 --max-tokens 32 --max-attempts 1 --timeout 60 --dry-run
 ```
 
-Use a representative sanitized dataset for real models. The existing case schema
-supports a unique `id`, `messages`, and at least one of `expected_exact`,
+Live CLI execution accepts only the bundled public dataset manifests (see Phase 3);
+custom sanitized datasets can be explored locally with mocks or a dry-run.
+The legacy case schema supports a unique `id`, `messages`, and at least one of `expected_exact`,
 `required_substrings`, or `forbidden_substrings`. Exact comparison normalizes case
 and whitespace. Substring checks are binary per applicable check category.
 
@@ -62,9 +68,9 @@ Remote arms share server health, budgets and rate limits. Use a fresh dedicated
 deployment, sufficient quotas, and controlled load. Explicit automatic policy
 options bypass canary assignment. The CLI currently supports unauthenticated
 benchmark deployments; it does not accept credentials in URLs or export request
-headers. It does not upload LangSmith experiments (`--langsmith` is rejected with
-benchmark mode). Server-side observability must be disabled separately for remote
-runs. HTTPX environment proxies and `.netrc` authentication are disabled.
+headers. The legacy `--langsmith` flag is rejected with benchmark mode; optional
+benchmark uploads instead require `--publish-langsmith` (see Phase 3 below).
+Server-side observability must be disabled separately for remote runs. HTTPX environment proxies and `.netrc` authentication are disabled.
 
 ## Report interpretation
 
@@ -81,7 +87,8 @@ runs. HTTPX environment proxies and `.netrc` authentication are disabled.
   includes failures; separate percentiles include successful responses only.
   Timing starts after the local concurrency semaphore and includes endpoint work,
   full response receipt, and response validation. In-process timing excludes TCP.
-- Quality averages score only successful responses using applicable checks.
+- In legacy/Phase 1 mode, quality averages score only successful responses using
+  applicable checks.
   `quality_pass_rate` divides fully passing responses by **all submitted requests**,
   so failures cannot inflate the passing rate. These checks are not a general
   semantic quality judge. Inspect per-case and per-task results before conclusions.
@@ -97,15 +104,17 @@ runs. HTTPX environment proxies and `.netrc` authentication are disabled.
   `known_completed_call_cost_usd` is explicitly a partial sum, accompanied by
   coverage counts. Unknown cost or usage is never silently summed as zero.
 - Observable `gateway_attempts` includes failed candidates plus the final success.
-  Terminal failures expose no attempt count. SDK-internal retries are unavailable.
+  Outside fault mode, terminal failures expose no attempt count. SDK-internal
+  retries are unavailable.
 - Simulated result counts are explicit per arm. Do not interpret mock cost
   differences or passing checks as measured production improvements.
 
 For a fair comparison, hold model versions, prices, dataset, generation settings,
 server resources and load fixed. Keep warm-up separate, repeat trials, and inspect
 tail latency alongside quality and failure counts. This implementation does not
-yet provide confidence intervals, automatic warm-up, fault-injection schedules,
-streaming metrics, semantic judging or automatic server-state reset for remote arms.
+yet provide confidence intervals, automatic warm-up, streaming metrics, or automatic
+server-state reset for remote arms. Mock fault schedules and optional semantic
+judging are described in the Phase 2 and Phase 3 sections below.
 
 ## Legacy evaluation and validation
 
@@ -133,8 +142,8 @@ New-Item -ItemType Directory -Force build | Out-Null
 .venv\Scripts\python.exe -m app.evaluation.cli --dataset evaluations/smoke.json --mock-smoke --fault-scenario evaluations/failover.json --fixed-models mock/fast --repetitions 50 --concurrency 1 --max-attempts 2 --temperature 0 --max-tokens 32 --output build/failover-demo.json
 ```
 
-Fault mode refuses to overwrite an existing output file. For another trial, choose
-a new output filename, for example `build/failover-demo-002.json`. It never needs
+All benchmark modes refuse to overwrite an existing output file. For another
+trial, choose a new output filename, for example `build/failover-demo-002.json`. It never needs
 to modify the Phase 1 `build/routing-smoke.json` report. To compare additional
 baselines, use `--fixed-models mock/fast mock/balanced mock/quality`; each baseline
 then receives the full 100-request schedule and its own comparisons.
@@ -143,13 +152,13 @@ then receives the full 100-request schedule and its own comparisons.
 
 | Requests per arm | Affected model | Injected fault |
 |---|---|---|
-| 1–10 | None | Healthy initial period |
-| 11–25 | `mock/fast` | Retryable rate limit, HTTP 429 |
-| 31–45 | `mock/quality` | Retryable unavailable response, HTTP 503 |
-| 51–65 | `mock/balanced` | Retryable provider timeout, HTTP 504 |
-| 81–85 | `mock/fast` | Non-retryable authentication failure, HTTP 401 |
+| 1â€“10 | None | Healthy initial period |
+| 11â€“25 | `mock/fast` | Retryable rate limit, HTTP 429 |
+| 31â€“45 | `mock/quality` | Retryable unavailable response, HTTP 503 |
+| 51â€“65 | `mock/balanced` | Retryable provider timeout, HTTP 504 |
+| 81â€“85 | `mock/fast` | Non-retryable authentication failure, HTTP 401 |
 
-The explicit recovery windows are 26–30, 46–50, 66–80, and 86–100: 40 requests
+The explicit recovery windows are 26â€“30, 46â€“50, 66â€“80, and 86â€“100: 40 requests
 per arm. There are 50 fault-window requests per arm. Fault windows describe
 provider availability, independently of whether an arm chooses the affected
 model. Healthy initial requests count toward overall success, not recovery rates.
@@ -159,7 +168,7 @@ different policies can avoid a fault by selecting a different initial model.
 Scenario JSON accepts a name, `request_interval_seconds`,
 `circuit_failure_threshold`, `circuit_cooldown_seconds`, `health_ewma_alpha`,
 `faults`, and `recovery_windows`. Each fault has `start`, `end`, `models`, `error`,
-and optional `delay_ms` (0–1000). Error types are `rate_limit`, `timeout`,
+and optional `delay_ms` (0â€“1000). Error types are `rate_limit`, `timeout`,
 `unavailable`, and `authentication`. Overlapping faults on the same model and
 overlapping/non-healthy recovery windows are rejected. The number of requests
 must cover every configured window. Only catalog mock IDs are accepted.

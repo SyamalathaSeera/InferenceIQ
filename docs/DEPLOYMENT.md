@@ -72,21 +72,32 @@ migration, frontend build/audit, and Docker build. The security workflow runs
 Gitleaks and CodeQL. Dependabot tracks Python, npm, Docker, and Actions updates.
 Protect the default branch with required checks and review.
 
-## GitHub first push
+## Local versus container configuration
 
-```powershell
-Set-Location C:\Users\Syamalatha\Desktop\InferenceIQ
-git init
-git add .
-git status
-git commit -m "Build production-ready InferenceIQ control plane"
-git branch -M main
-git remote add origin YOUR_GITHUB_REPOSITORY_URL
-git push -u origin main
-```
+The local `.env.example` defaults to SQLite, mock inference, and optional project
+authentication. Compose instead requires PostgreSQL, admin, and audit secrets,
+enables authentication, disables automatic schema creation, and waits for the
+migration job before starting the API. The Docker image builds the dashboard;
+local Python startup alone does not build it. Use `/dashboard/` after a build.
 
-Review `git status` before committing. It must not contain `.env`, databases,
-private keys, caches, `node_modules`, or generated dashboard assets.
+Compose forwards only the environment entries declared in `compose.yaml`. In
+particular, custom model names, token prices, circuit tuning, and the Ollama URL
+are not forwarded by the current Compose file. Add reviewed overrides when
+configuring these; placing an extra variable in the Compose env file alone does
+not inject it into the container. An Ollama service running on the host also
+requires an address reachable from the container, not container-local localhost.
+The CLI currently has no authenticated remote-benchmark header option; use the
+credential-free in-process mock benchmark for the documented demo.
+
+The image runs as a non-root user and defines a readiness health check. These are
+implementation choices, not a security certification or proof of production
+readiness. Half-open circuit probing still permits concurrent probes; streaming
+does not share the non-streaming fallback/accounting path. Review these limits
+and [benchmark evidence](BENCHMARKS.md) before drawing deployment conclusions.
+
+Local reports under `build/` are ignored by Git and are not explicitly copied
+into the runtime image. Git ignore rules and Docker context exclusions are
+separate; review `.dockerignore` when introducing additional local-only files.
 
 ## Release checklist
 
