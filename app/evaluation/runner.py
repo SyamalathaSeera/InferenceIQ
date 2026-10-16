@@ -10,6 +10,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.evaluation.evaluators import aggregate_score, evaluate_output
+from app.evaluation.faults import FaultContext
 from app.evaluation.models import (
     BenchmarkArmSummary,
     BenchmarkCaseResult,
@@ -17,6 +18,9 @@ from app.evaluation.models import (
     EvaluationCase,
     EvaluationCaseResult,
     EvaluationReport,
+    FaultScenario,
+    ReliabilityArmSummary,
+    ReliabilityComparison,
 )
 from app.inference.metrics import calculate_cost
 from app.inference.models import ModelProfile
@@ -167,7 +171,92 @@ def summarize_benchmark(
                 row.selected_model for row in rows if row.selected_model is not None
             )
         ),
+        reliability=(
+            summarize_reliability(rows)
+            if any(row.fault_request_index is not None for row in rows)
+            else None
+        ),
     )
+
+
+def summarize_reliability(rows: list[BenchmarkCaseResult]) -> ReliabilityArmSummary:
+    fault_rows = [row for row in rows if row.fault_window]
+    recovery_rows = [row for row in rows if row.recovery_window]
+    failed_primary = [
+        row
+        for row in rows
+        if row.attempt_details and not row.attempt_details[0].success
+    ]
+    fallback_rows = [row for row in rows if (row.gateway_attempts or 0) > 1]
+
+    def rate(selected):
+        return (
+            sum(row.success for row in selected) / len(selected) if selected else None
+        )
+
+    return ReliabilityArmSummary(
+        fault_window_requests=len(fault_rows),
+        fault_window_success_rate=rate(fault_rows),
+        recovery_window_requests=len(recovery_rows),
+        recovery_success_rate=rate(recovery_rows),
+        primary_failure_requests=len(failed_primary),
+        primary_failure_recovery_rate=rate(failed_primary),
+        fallback_requests=len(fallback_rows),
+        fallback_success_rate=rate(fallback_rows),
+        total_gateway_attempts=sum(row.gateway_attempts or 0 for row in rows),
+        mean_gateway_attempts=sum(row.gateway_attempts or 0 for row in rows)
+        / len(rows),
+        circuit_blocked_requests=sum(
+            row.gateway_attempts == 0
+            and not row.success
+            and "open" in row.circuit_before.values()
+            and row.http_status in {422, 503}
+            for row in rows
+        ),
+        circuit_avoidance_successes=sum(
+            row.success and bool(row.avoided_open_models) for row in rows
+        ),
+        half_open_probes=sum(
+            attempt.circuit_state == "half_open"
+            for row in rows
+            for attempt in row.attempt_details
+        ),
+        circuits_opened=sum(
+            state == "open" and row.circuit_before.get(model, "closed") != "open"
+            for row in rows
+            for model, state in row.circuit_after.items()
+        ),
+    )
+
+
+def compare_reliability(arms: list[BenchmarkArmSummary]) -> list[ReliabilityComparison]:
+    def difference(candidate, baseline):
+        return (
+            (candidate - baseline) * 100
+            if (candidate is not None and baseline is not None)
+            else None
+        )
+
+    return [
+        ReliabilityComparison(
+            baseline_arm=baseline.arm,
+            automatic_arm=automatic.arm,
+            success_improvement_pp=(automatic.success_rate - baseline.success_rate)
+            * 100,
+            fault_window_success_improvement_pp=difference(
+                automatic.reliability.fault_window_success_rate,
+                baseline.reliability.fault_window_success_rate,
+            ),
+            recovery_success_improvement_pp=difference(
+                automatic.reliability.recovery_success_rate,
+                baseline.reliability.recovery_success_rate,
+            ),
+        )
+        for baseline in arms
+        if baseline.arm.startswith("fixed:") and baseline.reliability
+        for automatic in arms
+        if automatic.arm.startswith("auto:") and automatic.reliability
+    ]
 
 
 async def run_benchmark(
@@ -181,6 +270,8 @@ async def run_benchmark(
     max_tokens: int | None = None,
     max_attempts: int = 1,
     clients_by_arm: dict[str, httpx.AsyncClient] | None = None,
+    fault_scenario: FaultScenario | None = None,
+    fault_contexts: dict[str, FaultContext] | None = None,
 ) -> BenchmarkReport:
     """Benchmark the real non-streaming HTTP route, retaining failed requests."""
     if not cases or repetitions < 1 or concurrency < 1 or not fixed_models:
@@ -205,9 +296,33 @@ async def run_benchmark(
         **parameters,
     )
     arms = benchmark_arms(fixed_models)
+    if fault_scenario is not None:
+        if concurrency != 1 or not clients_by_arm or not fault_contexts:
+            raise ValueError("Fault runs require serial, isolated in-process arms")
+        if any(
+            arm not in fault_contexts or arm not in clients_by_arm for arm, _, _ in arms
+        ):
+            raise ValueError("Every arm requires a fault context and client")
+        contexts = [fault_contexts[arm] for arm, _, _ in arms]
+        if len({id(context.app) for context in contexts}) != len(arms):
+            raise ValueError("Fault arms must not share application state")
+        for context in contexts:
+            if (
+                context.scenario != fault_scenario
+                or context.index
+                or await context.snapshot()
+            ):
+                raise ValueError(
+                    "Fault arms require matching scenarios and fresh health state"
+                )
+        windows = fault_scenario.faults + fault_scenario.recovery_windows
+        if repetitions * len(cases) < max(window.end for window in windows):
+            raise ValueError("Request count must cover every scenario window")
+    elif fault_contexts:
+        raise ValueError("Fault contexts require a scenario")
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def measure(case, repetition, arm, model, policy):
+    async def measure(case, repetition, arm, model, policy, request_index):
         payload = ChatCompletionRequest(
             model=model,
             messages=case.messages,
@@ -215,6 +330,9 @@ async def run_benchmark(
             **parameters,
         ).model_dump(exclude_none=True)
         async with semaphore:
+            context = fault_contexts[arm] if fault_scenario is not None else None
+            if context:
+                await context.begin(request_index)
             started_at = perf_counter()
             status = None
             data = None
@@ -238,17 +356,19 @@ async def run_benchmark(
             except (ValidationError, ValueError, TypeError):
                 error = "invalid_response"
             elapsed = (perf_counter() - started_at) * 1000
+            row = BenchmarkCaseResult(
+                arm=arm,
+                case_id=case.id,
+                repetition=repetition,
+                requested_model=model,
+                http_status=status,
+                success=data is not None,
+                error=error,
+                latency_ms=elapsed,
+            )
+            if context:
+                await context.observe(row)
 
-        row = BenchmarkCaseResult(
-            arm=arm,
-            case_id=case.id,
-            repetition=repetition,
-            requested_model=model,
-            http_status=status,
-            success=data is not None,
-            error=error,
-            latency_ms=elapsed,
-        )
         if data is None:
             return row
         row.response_model = data.model
@@ -316,7 +436,16 @@ async def run_benchmark(
         for case_index, case in enumerate(cases):
             offset = (repetition - 1 + case_index) % len(arms)
             for arm, model, policy in arms[offset:] + arms[:offset]:
-                tasks.append(measure(case, repetition, arm, model, policy))
+                tasks.append(
+                    measure(
+                        case,
+                        repetition,
+                        arm,
+                        model,
+                        policy,
+                        (repetition - 1) * len(cases) + case_index + 1,
+                    )
+                )
     results = await asyncio.gather(*tasks)
     order = {arm: index for index, (arm, _, _) in enumerate(arms)}
     case_order = {case.id: index for index, case in enumerate(cases)}
@@ -326,7 +455,11 @@ async def run_benchmark(
     canonical = json.dumps(
         [case.model_dump(mode="json") for case in cases], sort_keys=True
     )
-    return BenchmarkReport(
+    summaries = [
+        summarize_benchmark(arm, [row for row in results if row.arm == arm])
+        for arm, _, _ in arms
+    ]
+    report = BenchmarkReport(
         dataset_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
         repetitions=repetitions,
         concurrency=concurrency,
@@ -358,9 +491,27 @@ async def run_benchmark(
             "explicit policies bypass canary assignment. "
             "No prompt/output text is exported.",
         ],
-        arms=[
-            summarize_benchmark(arm, [row for row in results if row.arm == arm])
-            for arm, _, _ in arms
-        ],
+        arms=summaries,
         results=results,
+        fault_scenario=fault_scenario,
+        reliability_comparisons=compare_reliability(summaries),
     )
+    if fault_scenario:
+        report.methodology.extend(
+            [
+                "Injected-fault simulation, not live-provider reliability. "
+                "Fault windows use per-arm request indices, "
+                "never provider-attempt counts.",
+                "Circuit time advances by the scenario interval between requests; "
+                "no cooldown sleeps. Routing latency uses catalog estimates "
+                "for determinism; reported client/provider wall times remain measured.",
+                "Recovery success means completion within explicit fault-free recovery "
+                "windows. Fault-window success is separate. Empty rates are null.",
+                "Fallback success is conditional on >=2 provider attempts. "
+                "Primary-failure recovery includes non-retryable failures. "
+                "Circuit blocks have zero attempts.",
+                "Percentage-point differences are automatic minus fixed rates * 100. "
+                "Health snapshots and injection add local measurement overhead.",
+            ]
+        )
+    return report

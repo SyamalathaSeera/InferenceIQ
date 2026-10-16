@@ -7,13 +7,16 @@ import httpx
 from langsmith import Client, tracing_context
 
 from app.config import Settings, get_settings
+from app.evaluation.faults import FaultContext, FaultInjectingMockProvider
 from app.evaluation.langsmith_experiment import LangSmithExperimentRunner
+from app.evaluation.models import FaultScenario
 from app.evaluation.runner import (
     benchmark_arms,
     load_dataset,
     run_benchmark,
     run_evaluation,
 )
+from app.inference.catalog import create_model_catalog
 from app.providers.factory import create_providers
 from app.schemas.chat import ChatCompletionRequest
 
@@ -24,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", help="provider/model identifier (legacy evaluation)")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--mock-smoke", action="store_true")
+    parser.add_argument("--fault-scenario", type=Path)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--fixed-models", nargs="+")
     parser.add_argument("--repetitions", type=int, default=1)
@@ -39,6 +43,13 @@ def parse_args() -> argparse.Namespace:
         help="Run and publish the experiment through LangSmith",
     )
     args = parser.parse_args()
+    if args.fault_scenario:
+        if not args.mock_smoke or args.concurrency != 1:
+            parser.error("--fault-scenario requires --mock-smoke and --concurrency 1")
+        if args.langsmith:
+            parser.error("Fault runs cannot upload LangSmith data")
+        if args.output and args.output.exists():
+            parser.error("Fault output already exists; select a new path")
     if args.mock_smoke:
         args.benchmark = True
     if args.benchmark:
@@ -61,6 +72,14 @@ def parse_args() -> argparse.Namespace:
 
 
 async def benchmark_command(args, cases):
+    scenario_path = getattr(args, "fault_scenario", None)
+    scenario = (
+        FaultScenario.model_validate_json(scenario_path.read_text(encoding="utf-8"))
+        if scenario_path
+        else None
+    )
+    if scenario and (not args.mock_smoke or args.concurrency != 1):
+        raise ValueError("Fault runs require isolated serial mock arms")
     options = {
         "cases": cases,
         "fixed_models": args.fixed_models,
@@ -102,13 +121,31 @@ async def benchmark_command(args, cases):
         auto_create_schema=True,
         inferenceiq_langsmith_enabled=False,
         inferenceiq_auth_required=False,
+        circuit_failure_threshold=scenario.circuit_failure_threshold if scenario else 3,
+        circuit_cooldown_seconds=scenario.circuit_cooldown_seconds if scenario else 30,
+        health_ewma_alpha=scenario.health_ewma_alpha if scenario else 0.2,
     )
     async with AsyncExitStack() as stack:
         stack.enter_context(tracing_context(enabled=False))
         clients = {}
+        contexts = {}
+        catalog_latency = {
+            profile.model_id: profile.estimated_latency_ms
+            for profile in create_model_catalog(settings)
+        }
         for arm, _, _ in benchmark_arms(args.fixed_models):
-            app = create_app(settings)
+            context = FaultContext(scenario) if scenario else None
+            app = create_app(
+                settings, **({"health_clock": context.now} if context else {})
+            )
             await stack.enter_async_context(app.router.lifespan_context(app))
+            if context:
+                context.app = app
+                contexts[arm] = context
+                app.state.providers = {"mock": FaultInjectingMockProvider(context)}
+                app.state.health_latency_ms = lambda model, elapsed: catalog_latency[
+                    model
+                ]
             clients[arm] = await stack.enter_async_context(
                 httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
@@ -118,7 +155,11 @@ async def benchmark_command(args, cases):
                 )
             )
         return await run_benchmark(
-            client=next(iter(clients.values())), clients_by_arm=clients, **options
+            client=next(iter(clients.values())),
+            clients_by_arm=clients,
+            fault_scenario=scenario,
+            fault_contexts=contexts or None,
+            **options,
         )
 
 
@@ -129,7 +170,11 @@ async def main() -> None:
         report = await benchmark_command(args, cases)
         rendered = report.model_dump_json(indent=2)
         if args.output:
-            args.output.write_text(rendered + "\n", encoding="utf-8")
+            if args.fault_scenario:
+                with args.output.open("x", encoding="utf-8") as output:
+                    output.write(rendered + "\n")
+            else:
+                args.output.write_text(rendered + "\n", encoding="utf-8")
         else:
             print(rendered)
         return

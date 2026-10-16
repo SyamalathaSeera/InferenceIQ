@@ -1,0 +1,18 @@
+{
+  "name": "mock-failover-100",
+  "request_interval_seconds": 1,
+  "circuit_failure_threshold": 3,
+  "circuit_cooldown_seconds": 5,
+  "faults": [
+    {"start": 11, "end": 25, "models": ["mock/fast"], "error": "rate_limit"},
+    {"start": 31, "end": 45, "models": ["mock/quality"], "error": "unavailable"},
+    {"start": 51, "end": 65, "models": ["mock/balanced"], "error": "timeout"},
+    {"start": 81, "end": 85, "models": ["mock/fast"], "error": "authentication"}
+  ],
+  "recovery_windows": [
+    {"start": 26, "end": 30},
+    {"start": 46, "end": 50},
+    {"start": 66, "end": 80},
+    {"start": 86, "end": 100}
+  ]
+}

@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field, model_validator
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.chat import ChatMessage
 
@@ -42,6 +44,90 @@ class EvaluationReport(BaseModel):
     results: list[EvaluationCaseResult]
 
 
+class RequestWindow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start: int = Field(ge=1)
+    end: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def ordered(self):
+        if self.end < self.start:
+            raise ValueError("Window end must be >= start")
+        return self
+
+
+class FaultWindow(RequestWindow):
+    models: list[Literal["mock/fast", "mock/balanced", "mock/quality"]] = Field(
+        min_length=1
+    )
+    error: Literal["rate_limit", "timeout", "unavailable", "authentication"]
+    delay_ms: float = Field(default=0, ge=0, le=1000, allow_inf_nan=False)
+
+
+class FaultScenario(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1)
+    request_interval_seconds: float = Field(
+        default=1, gt=0, le=86400, allow_inf_nan=False
+    )
+    health_ewma_alpha: float = Field(default=0.2, gt=0, le=1, allow_inf_nan=False)
+    circuit_failure_threshold: int = Field(default=3, ge=1)
+    circuit_cooldown_seconds: int = Field(default=5, ge=1)
+    faults: list[FaultWindow] = Field(min_length=1)
+    recovery_windows: list[RequestWindow] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def unambiguous(self):
+        for index, window in enumerate(self.faults):
+            for other in self.faults[index + 1 :]:
+                if max(window.start, other.start) <= min(window.end, other.end) and set(
+                    window.models
+                ) & set(other.models):
+                    raise ValueError("Fault windows cannot overlap on the same model")
+        for index, window in enumerate(self.recovery_windows):
+            others = self.faults + self.recovery_windows[index + 1 :]
+            if any(
+                max(window.start, other.start) <= min(window.end, other.end)
+                for other in others
+            ):
+                raise ValueError("Recovery windows must be disjoint and fault-free")
+        return self
+
+
+class FaultAttemptResult(BaseModel):
+    model: str
+    success: bool
+    status_code: int
+    error_category: str | None = None
+    retryable: bool | None = None
+    circuit_state: str
+
+
+class ReliabilityArmSummary(BaseModel):
+    fault_window_requests: int
+    fault_window_success_rate: float | None
+    recovery_window_requests: int
+    recovery_success_rate: float | None
+    primary_failure_requests: int
+    primary_failure_recovery_rate: float | None
+    fallback_requests: int
+    fallback_success_rate: float | None
+    total_gateway_attempts: int
+    mean_gateway_attempts: float
+    circuit_blocked_requests: int
+    circuit_avoidance_successes: int
+    half_open_probes: int
+    circuits_opened: int
+
+
+class ReliabilityComparison(BaseModel):
+    baseline_arm: str
+    automatic_arm: str
+    success_improvement_pp: float
+    fault_window_success_improvement_pp: float | None
+    recovery_success_improvement_pp: float | None
+
+
 class BenchmarkCaseResult(BaseModel):
     arm: str
     case_id: str
@@ -63,6 +149,15 @@ class BenchmarkCaseResult(BaseModel):
     simulated: bool | None = None
     quality_score: float | None = None
     evaluator_scores: dict[str, float] = Field(default_factory=dict)
+    fault_request_index: int | None = None
+    virtual_time_seconds: float | None = None
+    fault_window: bool = False
+    recovery_window: bool = False
+    attempt_details: list[FaultAttemptResult] = Field(default_factory=list)
+    fallback_models: list[str] = Field(default_factory=list)
+    circuit_before: dict[str, str] = Field(default_factory=dict)
+    circuit_after: dict[str, str] = Field(default_factory=dict)
+    avoided_open_models: list[str] = Field(default_factory=list)
 
 
 class BenchmarkArmSummary(BaseModel):
@@ -85,6 +180,7 @@ class BenchmarkArmSummary(BaseModel):
     cost_known_requests: int
     simulated_requests: int
     model_distribution: dict[str, int]
+    reliability: ReliabilityArmSummary | None = None
 
 
 class BenchmarkReport(BaseModel):
@@ -99,3 +195,5 @@ class BenchmarkReport(BaseModel):
     methodology: list[str]
     arms: list[BenchmarkArmSummary]
     results: list[BenchmarkCaseResult]
+    fault_scenario: FaultScenario | None = None
+    reliability_comparisons: list[ReliabilityComparison] = Field(default_factory=list)

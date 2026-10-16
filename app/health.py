@@ -21,9 +21,10 @@ async def load_model_health(
     session: AsyncSession,
     *,
     cooldown_seconds: int,
+    now: datetime | None = None,
 ) -> dict[str, ModelHealth]:
     records = list((await session.scalars(select(ProviderHealthRecord))).all())
-    now = utc_now()
+    now = now if now is not None else utc_now()
     changed = False
     for record in records:
         if (
@@ -45,10 +46,11 @@ async def record_provider_attempts(
     *,
     failure_threshold: int,
     ewma_alpha: float,
+    now: datetime | None = None,
 ) -> None:
     if not attempts:
         return
-    now = utc_now()
+    now = now if now is not None else utc_now()
     for attempt in attempts:
         record = await session.scalar(
             select(ProviderHealthRecord)
