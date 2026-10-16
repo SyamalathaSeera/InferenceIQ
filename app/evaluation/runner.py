@@ -7,6 +7,7 @@ from pathlib import Path
 from time import perf_counter
 
 import httpx
+from langsmith import tracing_context
 from pydantic import ValidationError
 
 from app.evaluation.evaluators import aggregate_score, evaluate_output
@@ -19,8 +20,19 @@ from app.evaluation.models import (
     EvaluationCaseResult,
     EvaluationReport,
     FaultScenario,
+    PriceCatalog,
+    QualityComparison,
     ReliabilityArmSummary,
     ReliabilityComparison,
+    VersionedDataset,
+)
+from app.evaluation.quality import (
+    EVALUATION_VERSION,
+    BudgetGuard,
+    catalog_cost,
+    fingerprint,
+    observed_usage,
+    semantic_evaluate,
 )
 from app.inference.metrics import calculate_cost
 from app.inference.models import ModelProfile
@@ -30,6 +42,12 @@ from app.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 
 def load_dataset(path: Path) -> list[EvaluationCase]:
     raw_cases = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw_cases, dict):
+        dataset = VersionedDataset.model_validate(raw_cases)
+        return [
+            case.model_copy(update={"dataset_version": dataset.version})
+            for case in dataset.cases
+        ]
     if not isinstance(raw_cases, list):
         raise ValueError("The evaluation dataset must be a JSON array")
     return [EvaluationCase.model_validate(case) for case in raw_cases]
@@ -40,6 +58,8 @@ async def run_evaluation(
     cases: list[EvaluationCase],
     model: str,
     providers: dict[str, ChatProvider],
+    budget: BudgetGuard | None = None,
+    price_catalog: PriceCatalog | None = None,
 ) -> EvaluationReport:
     provider_name = _provider_name(model)
     provider = providers.get(provider_name)
@@ -53,9 +73,21 @@ async def run_evaluation(
 
     results: list[EvaluationCaseResult] = []
     for case in cases:
+        if budget and not budget.reserve():
+            raise ProviderError(
+                "Budget halted before the next request", retryable=False
+            )
         request = ChatCompletionRequest(model=model, messages=case.messages)
         started_at = perf_counter()
-        response = await provider.complete(request)
+        with tracing_context(enabled=False):
+            response = await provider.complete(request)
+        input_tokens, output_tokens = observed_usage(response.model_dump())
+        if budget:
+            budget.observe(
+                catalog_cost(price_catalog, model, input_tokens, output_tokens)
+                if price_catalog
+                else None
+            )
         latency_ms = (perf_counter() - started_at) * 1000
         output = response.choices[0].message.content or ""
         evaluator_scores = evaluate_output(case, output)
@@ -63,13 +95,15 @@ async def run_evaluation(
         results.append(
             EvaluationCaseResult(
                 case_id=case.id,
-                passed=score == 1.0,
-                score=round(score, 4),
+                passed=score == 1.0 and not case.semantic_rubric,
+                score=round(score, 4)
+                if score is not None and not case.semantic_rubric
+                else None,
                 evaluator_scores=evaluator_scores,
                 output=output,
                 latency_ms=round(latency_ms, 2),
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
         )
 
@@ -78,20 +112,26 @@ async def run_evaluation(
         model=model,
         total_cases=count,
         passed_cases=sum(result.passed for result in results),
-        pass_rate=round(
-            sum(result.passed for result in results) / count if count else 0,
-            4,
+        pass_rate=(
+            sum(result.passed for result in results) / len(scored)
+            if (
+                scored := [
+                    result.score for result in results if result.score is not None
+                ]
+            )
+            else None
         ),
-        average_score=round(
-            sum(result.score for result in results) / count if count else 0,
-            4,
-        ),
+        average_score=sum(scored) / len(scored) if scored else None,
         average_latency_ms=round(
             sum(result.latency_ms for result in results) / count if count else 0,
             2,
         ),
-        total_input_tokens=sum(result.input_tokens for result in results),
-        total_output_tokens=sum(result.output_tokens for result in results),
+        total_input_tokens=sum(result.input_tokens for result in results)
+        if all(result.input_tokens is not None for result in results)
+        else None,
+        total_output_tokens=sum(result.output_tokens for result in results)
+        if all(result.output_tokens is not None for result in results)
+        else None,
         results=results,
     )
 
@@ -122,8 +162,12 @@ def percentile(values: list[float], fraction: float) -> float | None:
 
 
 def summarize_benchmark(
-    arm: str, rows: list[BenchmarkCaseResult]
+    arm: str,
+    rows: list[BenchmarkCaseResult],
+    *,
+    strict_quality: bool = False,
 ) -> BenchmarkArmSummary:
+    submitted = [row for row in rows if row.submitted]
     successful = [row for row in rows if row.success]
     scored = [row.quality_score for row in rows if row.quality_score is not None]
     costs = [
@@ -135,13 +179,24 @@ def summarize_benchmark(
     known_usage = sum(
         row.input_tokens is not None and row.output_tokens is not None for row in rows
     )
+    passed = sum(
+        row.quality_passed if row.quality_passed is not None else row.quality_score == 1
+        for row in rows
+    )
+    total_cost = (
+        sum(row.request_cost_usd for row in rows) if known_costs == len(rows) else None
+    )
     return BenchmarkArmSummary(
         arm=arm,
         requests=len(rows),
         successes=len(successful),
-        success_rate=len(successful) / len(rows),
-        p50_latency_ms=percentile([row.latency_ms for row in rows], 0.50),
-        p95_latency_ms=percentile([row.latency_ms for row in rows], 0.95),
+        success_rate=len(successful) / len(submitted) if submitted else None,
+        p50_latency_ms=percentile(
+            [row.latency_ms for row in rows if row.latency_ms is not None], 0.50
+        ),
+        p95_latency_ms=percentile(
+            [row.latency_ms for row in rows if row.latency_ms is not None], 0.95
+        ),
         successful_p50_latency_ms=percentile(
             [row.latency_ms for row in successful], 0.50
         ),
@@ -150,7 +205,18 @@ def summarize_benchmark(
         ),
         average_quality_score=sum(scored) / len(scored) if scored else None,
         quality_scored_requests=len(scored),
-        quality_pass_rate=sum(score == 1 for score in scored) / len(rows),
+        quality_pass_rate=(passed / len(scored) if scored else None)
+        if strict_quality
+        else passed / len(rows),
+        quality_unknown_requests=len(rows) - len(scored),
+        quality_passed_requests=passed,
+        submitted_requests=len(submitted),
+        cost_per_request_usd=total_cost / len(rows) if total_cost is not None else None,
+        cost_per_quality_passing_response_usd=(
+            total_cost / passed
+            if total_cost is not None and passed > 0 and len(scored) == len(rows)
+            else None
+        ),
         total_input_tokens=(
             sum(row.input_tokens for row in rows) if known_usage == len(rows) else None
         ),
@@ -259,6 +325,63 @@ def compare_reliability(arms: list[BenchmarkArmSummary]) -> list[ReliabilityComp
     ]
 
 
+def compare_quality(arms: list[BenchmarkArmSummary]) -> list[QualityComparison]:
+    def difference(value, baseline, scale=1):
+        return (
+            (value - baseline) * scale
+            if value is not None and baseline is not None
+            else None
+        )
+
+    comparisons = []
+    for baseline in arms:
+        if not baseline.arm.startswith("fixed:"):
+            continue
+        for candidate in arms:
+            if candidate.arm == baseline.arm:
+                continue
+            complete = (
+                candidate.submitted_requests == candidate.requests
+                and baseline.submitted_requests == baseline.requests
+            )
+            quality_complete = complete and not (
+                candidate.quality_unknown_requests or baseline.quality_unknown_requests
+            )
+            comparisons.append(
+                QualityComparison(
+                    baseline_arm=baseline.arm,
+                    comparison_arm=candidate.arm,
+                    quality_pass_rate_difference_pp=difference(
+                        candidate.quality_pass_rate, baseline.quality_pass_rate, 100
+                    )
+                    if quality_complete
+                    else None,
+                    cost_per_request_difference_usd=difference(
+                        candidate.cost_per_request_usd, baseline.cost_per_request_usd
+                    )
+                    if complete
+                    else None,
+                    cost_per_quality_passing_response_difference_usd=difference(
+                        candidate.cost_per_quality_passing_response_usd,
+                        baseline.cost_per_quality_passing_response_usd,
+                    )
+                    if complete
+                    else None,
+                    p50_latency_difference_ms=difference(
+                        candidate.p50_latency_ms, baseline.p50_latency_ms
+                    )
+                    if complete
+                    else None,
+                    p95_latency_difference_ms=difference(
+                        candidate.p95_latency_ms, baseline.p95_latency_ms
+                    )
+                    if complete
+                    else None,
+                )
+            )
+    return comparisons
+
+
 async def run_benchmark(
     *,
     cases: list[EvaluationCase],
@@ -272,6 +395,11 @@ async def run_benchmark(
     clients_by_arm: dict[str, httpx.AsyncClient] | None = None,
     fault_scenario: FaultScenario | None = None,
     fault_contexts: dict[str, FaultContext] | None = None,
+    quality_mode: bool = False,
+    quality_threshold: float = 1,
+    price_catalog: PriceCatalog | None = None,
+    semantic_judge_model: str | None = None,
+    budget: BudgetGuard | None = None,
 ) -> BenchmarkReport:
     """Benchmark the real non-streaming HTTP route, retaining failed requests."""
     if not cases or repetitions < 1 or concurrency < 1 or not fixed_models:
@@ -296,6 +424,14 @@ async def run_benchmark(
         **parameters,
     )
     arms = benchmark_arms(fixed_models)
+    if not 0 <= quality_threshold <= 1:
+        raise ValueError("Quality threshold must be within [0, 1]")
+    if fault_scenario and (semantic_judge_model or budget):
+        raise ValueError(
+            "Fault schedules cannot be combined with judges or live budgets"
+        )
+    if budget and concurrency != 1:
+        raise ValueError("Guarded live runs require concurrency 1")
     if fault_scenario is not None:
         if concurrency != 1 or not clients_by_arm or not fault_contexts:
             raise ValueError("Fault runs require serial, isolated in-process arms")
@@ -322,72 +458,109 @@ async def run_benchmark(
         raise ValueError("Fault contexts require a scenario")
     semaphore = asyncio.Semaphore(concurrency)
 
+    async def score_answer(row, case, answer, target):
+        scores = evaluate_output(case, answer)
+        if case.semantic_rubric:
+            score, judge_cost, reason, requested = await semantic_evaluate(
+                case,
+                answer,
+                client=target,
+                model=semantic_judge_model,
+                catalog=price_catalog,
+                budget=budget,
+            )
+            row.judge_cost_usd = judge_cost
+            row.judge_requested = requested
+            if score is None:
+                row.quality_missing_reason = reason
+            else:
+                scores["semantic"] = score
+        row.evaluator_scores = scores
+        row.quality_score = (
+            aggregate_score(scores) if not row.quality_missing_reason else None
+        )
+        if row.quality_score is not None:
+            row.quality_passed = row.quality_score >= quality_threshold
+        elif row.quality_missing_reason is None:
+            row.quality_missing_reason = "no_applicable_assertions"
+
     async def measure(case, repetition, arm, model, policy, request_index):
+        async with semaphore:
+            return await execute_request(
+                case, repetition, arm, model, policy, request_index
+            )
+
+    async def execute_request(case, repetition, arm, model, policy, request_index):
         payload = ChatCompletionRequest(
             model=model,
             messages=case.messages,
             inferenceiq={"policy": policy, "max_attempts": max_attempts},
             **parameters,
         ).model_dump(exclude_none=True)
-        async with semaphore:
-            context = fault_contexts[arm] if fault_scenario is not None else None
-            if context:
-                await context.begin(request_index)
-            started_at = perf_counter()
-            status = None
-            data = None
-            error = None
-            try:
-                target = clients_by_arm[arm] if clients_by_arm else client
-                response = await target.post("/v1/chat/completions", json=payload)
-                status = response.status_code
-                if response.is_success:
-                    data = ChatCompletionResponse.model_validate(response.json())
-                    if not data.choices:
-                        error = "invalid_response"
-                        data = None
-                else:
-                    # Never copy server bodies, prompts, headers or exception strings.
-                    error = f"http_{status}"
-            except httpx.TimeoutException:
-                error = "client_timeout"
-            except httpx.RequestError:
-                error = "transport_error"
-            except (ValidationError, ValueError, TypeError):
-                error = "invalid_response"
-            elapsed = (perf_counter() - started_at) * 1000
-            row = BenchmarkCaseResult(
+        if budget and not budget.reserve():
+            return BenchmarkCaseResult(
                 arm=arm,
                 case_id=case.id,
                 repetition=repetition,
                 requested_model=model,
-                http_status=status,
-                success=data is not None,
-                error=error,
-                latency_ms=elapsed,
+                latency_ms=None,
+                submitted=False,
+                error="budget_halted",
             )
-            if context:
-                await context.observe(row)
+        context = fault_contexts[arm] if fault_scenario is not None else None
+        if context:
+            await context.begin(request_index)
+        started_at = perf_counter()
+        status = None
+        data = None
+        error = None
+        try:
+            target = clients_by_arm[arm] if clients_by_arm else client
+            response = await target.post("/v1/chat/completions", json=payload)
+            status = response.status_code
+            if response.is_success:
+                data = ChatCompletionResponse.model_validate(response.json())
+                if not data.choices:
+                    error = "invalid_response"
+                    data = None
+            else:
+                # Never copy server bodies, prompts, headers or exception strings.
+                error = f"http_{status}"
+        except httpx.TimeoutException:
+            error = "client_timeout"
+        except httpx.RequestError:
+            error = "transport_error"
+        except (ValidationError, ValueError, TypeError):
+            error = "invalid_response"
+        elapsed = (perf_counter() - started_at) * 1000
+        row = BenchmarkCaseResult(
+            arm=arm,
+            case_id=case.id,
+            repetition=repetition,
+            requested_model=model,
+            http_status=status,
+            success=data is not None,
+            error=error,
+            latency_ms=elapsed,
+        )
+        if context:
+            await context.observe(row)
 
         if data is None:
+            if budget:
+                budget.observe(None)
             return row
         row.response_model = data.model
         row.simulated = data.metadata.get("simulated", False)
-        scores = evaluate_output(case, data.choices[0].message.content or "")
-        row.evaluator_scores = scores
-        row.quality_score = aggregate_score(scores) if scores else None
         # Legacy providers can serialize default zero usage; explicit availability
         # metadata distinguishes missing usage from a legitimate observed zero.
-        raw_usage = response.json().get("usage") or {}
-        if data.metadata.get("usage_available", True) and all(
-            type(raw_usage.get(key)) is int and raw_usage[key] >= 0
-            for key in ("prompt_tokens", "completion_tokens")
-        ):
-            row.input_tokens = data.usage.prompt_tokens
-            row.output_tokens = data.usage.completion_tokens
+        row.input_tokens, row.output_tokens = observed_usage(response.json())
         receipt = data.inference_receipt
         if receipt is None:
             row.selected_model = data.model
+            if budget:
+                budget.observe(None)
+            await score_answer(row, case, data.choices[0].message.content or "", target)
             return row
         row.selected_model = receipt.selected_model
         row.gateway_attempts = len(receipt.fallbacks) + 1
@@ -428,6 +601,45 @@ async def run_benchmark(
             )
             if not receipt.fallbacks:
                 row.request_cost_usd = row.completed_call_cost_usd
+        if price_catalog:
+            row.pricing_version = price_catalog.version
+            row.routing_input_cost_per_million = row.input_cost_per_million
+            row.routing_output_cost_per_million = row.output_cost_per_million
+            price = price_catalog.models.get(receipt.selected_model)
+            row.input_cost_per_million = price.input_cost_per_million if price else None
+            row.output_cost_per_million = (
+                price.output_cost_per_million if price else None
+            )
+            if (
+                price is not None
+                and candidate is not None
+                and all(
+                    value is not None
+                    for value in (
+                        price.input_cost_per_million,
+                        price.output_cost_per_million,
+                        candidate.input_cost_per_million,
+                        candidate.output_cost_per_million,
+                    )
+                )
+            ):
+                row.pricing_matches_routing = (
+                    price.input_cost_per_million == candidate.input_cost_per_million
+                    and price.output_cost_per_million
+                    == candidate.output_cost_per_million
+                )
+            row.completed_call_cost_usd = catalog_cost(
+                price_catalog,
+                receipt.selected_model,
+                row.input_tokens,
+                row.output_tokens,
+            )
+            row.request_cost_usd = (
+                row.completed_call_cost_usd if not receipt.fallbacks else None
+            )
+        if budget:
+            budget.observe(row.request_cost_usd)
+        await score_answer(row, case, data.choices[0].message.content or "", target)
         return row
 
     # Rotate arm order per case/repetition to avoid always measuring fixed first.
@@ -456,7 +668,9 @@ async def run_benchmark(
         [case.model_dump(mode="json") for case in cases], sort_keys=True
     )
     summaries = [
-        summarize_benchmark(arm, [row for row in results if row.arm == arm])
+        summarize_benchmark(
+            arm, [row for row in results if row.arm == arm], strict_quality=quality_mode
+        )
         for arm, _, _ in arms
     ]
     report = BenchmarkReport(
@@ -471,10 +685,18 @@ async def run_benchmark(
             "Non-streaming client wall time includes HTTP completion and validation; "
             "excludes local semaphore queue time. "
             "Percentiles use linear interpolation.",
-            "Quality averages use applicable assertions on successful responses; "
-            "quality pass rate uses all submitted requests, including failures.",
-            "Costs use receipt candidate prices and reported usage, "
-            "not predicted tokens. "
+            (
+                "Quality-v1 pass rates use scored answers; "
+                "inspect missing-score coverage."
+                if quality_mode
+                else "Legacy pass rates include all submitted requests and failures."
+            ),
+            (
+                "Costs use the versioned price snapshot and reported usage. "
+                if price_catalog
+                else "Costs use receipt candidate prices and reported usage, "
+            )
+            + "not predicted tokens. "
             "Unknown totals remain null; known completed-call costs are partial sums.",
             "Fallback request costs are unknown: failed-call usage is unavailable. "
             "Gateway attempts exclude SDK retries; failures may hide attempts. "
@@ -495,7 +717,44 @@ async def run_benchmark(
         results=results,
         fault_scenario=fault_scenario,
         reliability_comparisons=compare_reliability(summaries),
+        dataset_version=cases[0].dataset_version,
+        evaluation_version=EVALUATION_VERSION if quality_mode else None,
+        quality_threshold=quality_threshold,
+        price_catalog=price_catalog,
+        price_catalog_sha256=fingerprint(price_catalog.model_dump())
+        if price_catalog
+        else None,
+        quality_comparisons=compare_quality(summaries) if quality_mode else [],
+        semantic_judge_model=semantic_judge_model,
+        budget_usd=budget.ceiling if budget else None,
+        reserved_budget_usd=budget.reserved if budget else None,
+        budget_halted=budget.halted if budget else False,
+        judge_requests=sum(row.judge_requested for row in results),
+        total_judge_cost_usd=(
+            sum(row.judge_cost_usd for row in results if row.judge_requested)
+            if any(row.judge_requested for row in results)
+            and all(
+                row.judge_cost_usd is not None for row in results if row.judge_requested
+            )
+            else None
+        ),
     )
+    if quality_mode:
+        report.methodology.extend(
+            [
+                "Quality-v1 pass rate uses scored answers only; "
+                "missing scores stay unknown. "
+                "Coverage and unknown counts must accompany every rate. "
+                "Quality differences require complete coverage on both arms.",
+                "Cost per request requires complete pricing/usage; "
+                "cost per passing answer "
+                "also requires complete quality coverage and at least one pass. "
+                "Judge charges are separate from inference cost.",
+                "Versioned price snapshots override receipt prices for quality runs. "
+                "Reservations are operator inputs, not guaranteed invoices; "
+                "unknown/excessive charges halt requests. Use provider account caps.",
+            ]
+        )
     if fault_scenario:
         report.methodology.extend(
             [
