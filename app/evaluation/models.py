@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -11,36 +11,82 @@ class EvaluationCase(BaseModel):
     expected_exact: str | None = None
     required_substrings: list[str] = Field(default_factory=list)
     forbidden_substrings: list[str] = Field(default_factory=list)
+    category: str = "general"
+    dataset_version: str = "legacy-v1"
+    expected_number: float | None = Field(default=None, allow_inf_nan=False)
+    number_tolerance: float = Field(default=0, ge=0, allow_inf_nan=False)
+    expected_json: dict[str, Any] | list[Any] | None = None
+    reference_answer: str | None = None
+    semantic_rubric: str | None = None
 
     @model_validator(mode="after")
     def requires_an_assertion(self) -> "EvaluationCase":
         if not (
-            self.expected_exact or self.required_substrings or self.forbidden_substrings
+            self.expected_exact is not None
+            or self.required_substrings
+            or self.forbidden_substrings
+            or self.expected_number is not None
+            or self.expected_json is not None
+            or (self.reference_answer and self.semantic_rubric)
         ):
             raise ValueError("An evaluation case requires at least one assertion")
         return self
 
 
+class VersionedDataset(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: str = Field(min_length=1)
+    description: str
+    cases: list[EvaluationCase] = Field(min_length=1)
+
+
+class CatalogPrice(BaseModel):
+    input_cost_per_million: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    output_cost_per_million: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+
+
+class PriceCatalog(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: str = Field(min_length=1)
+    source: str
+    simulated: bool = False
+    models: dict[str, CatalogPrice]
+
+
+class QualityComparison(BaseModel):
+    baseline_arm: str
+    comparison_arm: str
+    quality_pass_rate_difference_pp: float | None
+    cost_per_request_difference_usd: float | None
+    cost_per_quality_passing_response_difference_usd: float | None
+    p50_latency_difference_ms: float | None
+    p95_latency_difference_ms: float | None
+
+
 class EvaluationCaseResult(BaseModel):
     case_id: str
     passed: bool
-    score: float
+    score: float | None
     evaluator_scores: dict[str, float]
     output: str
     latency_ms: float
-    input_tokens: int
-    output_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
 
 
 class EvaluationReport(BaseModel):
     model: str
     total_cases: int
     passed_cases: int
-    pass_rate: float
-    average_score: float
+    pass_rate: float | None
+    average_score: float | None
     average_latency_ms: float
-    total_input_tokens: int
-    total_output_tokens: int
+    total_input_tokens: int | None
+    total_output_tokens: int | None
     results: list[EvaluationCaseResult]
 
 
@@ -138,7 +184,8 @@ class BenchmarkCaseResult(BaseModel):
     http_status: int | None = None
     success: bool = False
     error: str | None = None
-    latency_ms: float
+    latency_ms: float | None
+    submitted: bool = True
     gateway_attempts: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -148,6 +195,14 @@ class BenchmarkCaseResult(BaseModel):
     request_cost_usd: float | None = None
     simulated: bool | None = None
     quality_score: float | None = None
+    quality_passed: bool | None = None
+    quality_missing_reason: str | None = None
+    pricing_version: str | None = None
+    routing_input_cost_per_million: float | None = None
+    routing_output_cost_per_million: float | None = None
+    pricing_matches_routing: bool | None = None
+    judge_cost_usd: float | None = None
+    judge_requested: bool = False
     evaluator_scores: dict[str, float] = Field(default_factory=dict)
     fault_request_index: int | None = None
     virtual_time_seconds: float | None = None
@@ -164,14 +219,19 @@ class BenchmarkArmSummary(BaseModel):
     arm: str
     requests: int
     successes: int
-    success_rate: float
-    p50_latency_ms: float
-    p95_latency_ms: float
+    success_rate: float | None
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
     successful_p50_latency_ms: float | None
     successful_p95_latency_ms: float | None
     average_quality_score: float | None
     quality_scored_requests: int
-    quality_pass_rate: float
+    quality_pass_rate: float | None
+    quality_unknown_requests: int = 0
+    quality_passed_requests: int = 0
+    submitted_requests: int = 0
+    cost_per_request_usd: float | None = None
+    cost_per_quality_passing_response_usd: float | None = None
     total_input_tokens: int | None
     total_output_tokens: int | None
     usage_known_requests: int
@@ -197,3 +257,16 @@ class BenchmarkReport(BaseModel):
     results: list[BenchmarkCaseResult]
     fault_scenario: FaultScenario | None = None
     reliability_comparisons: list[ReliabilityComparison] = Field(default_factory=list)
+    dataset_version: str | None = None
+    evaluation_version: str | None = None
+    quality_threshold: float = 1
+    price_catalog: PriceCatalog | None = None
+    price_catalog_sha256: str | None = None
+    quality_comparisons: list[QualityComparison] = Field(default_factory=list)
+    semantic_judge_model: str | None = None
+    budget_usd: float | None = None
+    reserved_budget_usd: float | None = None
+    budget_halted: bool = False
+    judge_requests: int = 0
+    total_judge_cost_usd: float | None = None
+    langsmith_experiments: list[dict[str, str | None]] = Field(default_factory=list)

@@ -45,7 +45,7 @@ This command is a template: replace the fixed ID with a catalog model. Requests
 to a real-provider server may incur charges; Phase 1 validation uses mocks only.
 
 ```powershell
-.venv\Scripts\python.exe -m app.evaluation.cli --benchmark --base-url http://127.0.0.1:8000 --dataset evaluations/smoke.json --fixed-models mock/fast mock/quality --repetitions 3 --concurrency 2 --temperature 0 --max-tokens 32 --max-attempts 1 --timeout 60
+.venv\Scripts\python.exe -m app.evaluation.cli --benchmark --base-url http://127.0.0.1:8000 --dataset evaluations/smoke.json --fixed-models mock/fast mock/quality --repetitions 3 --concurrency 2 --temperature 0 --max-tokens 32 --max-attempts 1 --timeout 60 --dry-run
 ```
 
 Use a representative sanitized dataset for real models. The existing case schema
@@ -116,8 +116,9 @@ streaming metrics, semantic judging or automatic server-state reset for remote a
 .venv\Scripts\python.exe -m ruff check app tests migrations
 ```
 
-The legacy `--langsmith` mode still explicitly publishes its dataset; it is separate
-from benchmark mode and is not used for smoke validation.
+The legacy `--langsmith` flag remains opt-in and now publishes locally computed
+scores with hashed case IDs. Raw dataset text and answers remain local. It is
+separate from benchmark mode and is not used for smoke validation.
 
 ## Phase 2: deterministic failover and recovery
 
@@ -249,3 +250,169 @@ Run all validation without writing pytest cache files:
 .venv\Scripts\python.exe -m ruff format --check app tests migrations
 .venv\Scripts\python.exe -m ruff check app tests migrations
 ```
+
+## Phase 3: answer quality and cost optimization
+
+`evaluations/quality.v1.json` contains **60 original non-sensitive questions** in
+ten categories: arithmetic, logic, Python, science, geography, language, history,
+data manipulation, writing, and systems. It is a versioned object with `version`,
+`description`, and `cases`; existing JSON-array datasets remain supported. Every
+case includes a reference answer. There are 54 deterministic cases and six
+open-ended writing cases with explicit semantic rubrics.
+
+This is a small development dataset, not an independently validated benchmark.
+Strict output-format checks are deliberate: a correct number buried in an
+explanation fails a question that requested only a number. The six open-ended
+cases require a judge; omitting one yields unknown scores, never automatic passes.
+
+Run the mock-only comparison with a fresh output filename:
+
+```powershell
+.venv\Scripts\python.exe -m app.evaluation.cli --dataset evaluations/quality.v1.json --mock-smoke --fixed-models mock/fast --repetitions 1 --concurrency 1 --temperature 0 --max-tokens 64 --output build/quality-smoke.json
+```
+
+This makes 300 inference requests through the actual endpoint (60 per arm).
+All benchmark output files are now created exclusively: existing reports are never
+overwritten. Choose a new filename for a repeated run. No judge calls or uploads
+occur by default. Existing Phase 1 and Phase 2 options remain available; the
+original mock smoke and fault scenarios continue to work.
+
+The mock echoes questions instead of answering them. Its quality scores therefore
+do not represent LLM capabilities. Its word-count usage and prices are simulated,
+and client latency measures local software execution, not real model serving.
+Do not interpret differing mock costs as retained-quality savings.
+
+### Scoring rules and unknown measurements
+
+- `expected_exact` uses case-insensitive whitespace normalization, as before.
+- `expected_number` requires a complete numeric response. Absolute tolerance is
+  configurable with `number_tolerance`; the default is exact numeric equality.
+- `expected_json` requires a matching JSON object/array. Key order is ignored;
+  extra fields, invalid JSON, and boolean/number substitutions fail.
+- Required and forbidden substrings retain their existing deterministic behavior.
+- Applicable check scores are averaged. `--quality-threshold` (default 1.0)
+  determines passing. A missing required semantic score makes the entire case
+  score unknown, even if another applicable check passed.
+
+Reports identify dataset version and content hash, evaluator version, threshold,
+generation parameters, price snapshot and hash, selected model, returned model ID,
+usage, HTTP outcomes, and measured client latency. Prompt/answer text is not exported.
+Old benchmark modes retain their original all-request quality denominator.
+In Phase 3, `quality_pass_rate` uses **scored answers only**; always report
+`quality_scored_requests` and `quality_unknown_requests` alongside it. Request
+failures and skipped requests have unknown answer quality and separate success
+and submission counts. Partial coverage cannot establish quality retention.
+
+Every fixed baseline is compared with every other arm. Differences are candidate
+minus baseline, with quality differences in percentage points and costs in USD.
+Quality-rate differences are unknown unless both arms have complete quality and
+submission coverage. Latency and cost comparisons are also withheld for incomplete
+submission plans. Negative cost/latency differences alone do not prove a useful
+tradeoff; inspect measured quality, coverage, and success first. Routing weights
+and catalog quality estimates are unchanged; evaluations do not retrain policies.
+
+### Versioned price accounting
+
+`evaluations/prices.mock.v1.json` is an explicitly simulated price snapshot matching
+the development mock catalog. For a live deployment, supply a separately reviewed
+immutable JSON file using the same `version`, `source`, `simulated`, and `models`
+schema. Every model entry has input/output USD prices per million tokens; missing
+prices may be null. No current live-provider prices are bundled or claimed.
+
+Phase 3 cost uses the selected model's **snapshot prices and reported token usage**,
+overriding receipt prices. The report retains routing prices and a
+`pricing_matches_routing` flag: align the deployment catalog with the reviewed
+snapshot before making cost-policy claims. Cost calculation follows the existing
+eight-decimal USD rounding rule. It excludes hardware, cache/reasoning price
+variants, hidden SDK retry charges, and provider billing adjustments.
+
+`cost_per_request_usd` requires known costs for every scheduled request.
+`cost_per_quality_passing_response_usd` divides total inference cost by passing
+responses only when cost and quality coverage are complete and at least one answer
+passes. Otherwise it is null. It includes the cost of non-passing answers. Missing
+usage/pricing, unknown fallback charges, zero passes, and missing semantic judgments
+never become fabricated zero costs. Observed zero usage or configured zero prices
+remain valid zeros. Judge requests/costs are recorded separately from inference cost.
+
+### Optional semantic evaluation
+
+`--semantic-judge-model provider/model` selects one fixed judge for every arm.
+It receives the same reference/rubric rules, temperature zero, and a 128-token
+output limit. It must return strict JSON `{"score": number}` within [0,1]. Invalid
+output, transport errors, missing judgments, and unavailable judges yield unknown
+scores; they do not pass. Judge latency is excluded from inference p50/p95, while
+judge charges consume the same live-run reservation budget.
+
+For privacy, CLI semantic judging is restricted to the exact bundled public dataset
+manifest. Arbitrary/custom datasets can use deterministic local checks, but cannot
+be forwarded to a judge through this CLI. Mock smoke rejects non-mock judges.
+A real judge uses the configured endpoint and may incur fees; it requires the same
+explicit approval and budget settings as live inference. Judge agreement and bias
+have not been calibrated against human reviewers, and model/version changes can
+change judgments. The pipeline supports assessment, not an asserted gold-standard
+measure of open-ended quality.
+
+### Live approval, budget preflight, and dry-run
+
+Preview a plan without loading provider settings, constructing provider clients,
+sending HTTP requests, creating LangSmith clients, or uploading anything:
+
+```powershell
+.venv\Scripts\python.exe -m app.evaluation.cli --dataset evaluations/quality.v1.json --benchmark --fixed-models mock/fast --dry-run --budget-usd 5 --request-budget-usd 0.01
+```
+
+This is a 300-request plan with a maximum reservation of USD 3.00. Adding a judge
+adds at most 30 judge requests and raises the reservation to USD 3.30. These are
+operator-configured **reservations, not measured or predicted provider charges**.
+Supply `--price-catalog` to identify a reviewed live snapshot in the preview.
+
+Live execution requires **all** of `--allow-live`, `--price-catalog`,
+`--budget-usd`, and `--request-budget-usd`. Obtain explicit approval before using
+`--allow-live`; no paid evaluation is authorized by this documentation. Guarded
+live runs require concurrency 1 and max-attempts 1, known baseline/judge prices,
+and enough budget to reserve the full comparison plus maximum judge calls before
+the first request. Simulated snapshots cannot authorize real-provider IDs.
+Legacy direct real-provider commands also require approval, pricing, and a reserved
+plan. Existing unauthenticated HTTP endpoint limitations still apply.
+
+Live CLI execution is restricted to the exact bundled public dataset manifests
+(`quality.v1.json` and the legacy `smoke.json`); custom datasets are accepted for
+mock runs and dry-runs only. This prevents accidentally forwarding private,
+medical, or proprietary dataset text through a live provider. Extending the trusted
+public dataset set requires a reviewed source change, not an upload-consent flag.
+
+Each call reserves the operator's per-call allowance without refunds. Unknown
+costs or costs above that allowance halt further calls. Unsent cases remain in
+the report as `submitted=false`, with null latency/usage/cost and `budget_halted`
+status; they are not reported as fast HTTP failures. Actual unknown or excessive
+cost is learned only after a response: **this client guard cannot guarantee a hard
+provider invoice cap**, especially with hidden SDK retries. Configure provider-side
+account limits as well, use conservative reservations, and review any halted trial
+as incomplete. This implementation makes no guarantee about live charges.
+
+### Optional LangSmith experiments
+
+Benchmark uploads require `--publish-langsmith` plus a public
+`--experiment-version` label. The existing `--langsmith` flag remains the legacy
+direct-evaluation option. Both are disabled by default; `--dry-run` never uploads,
+even when publication flags are present. Credentials are read only through normal
+SDK configuration for an explicitly requested upload; never put them in a dataset,
+URL, report, or command argument.
+
+The benchmark publisher replays **already computed local results** using the
+installed SDK's `has_dataset`, `read_dataset`, `create_dataset`, `create_examples`,
+`list_examples`, and `aevaluate` APIs. It does not call models again. Only hashed
+case IDs, repetition numbers, score/success/cost/latency scalars, and non-content
+configuration metadata are sent. Prompt text, reference answers, judge rubrics,
+generated answers, and raw model/case IDs are not uploaded. Legacy experiments
+now compute scores locally and upload metric-only replays as well.
+
+Dataset names derive from content/manifest fingerprints and are reused after
+manifest validation. Changing the experiment version creates a new set of
+experiments on that dataset; evaluator/pricing hashes, generation settings, judge
+hash, threshold, and arm hash let reviewers compare configurations without exposing
+text. Select experiment versions in LangSmith for comparison; local JSON reports
+retain readable arm identifiers. This is a metric-only comparison, not a text
+inspection workflow. No real LangSmith upload or live-provider test was performed
+as part of Phase 3 implementation validation; SDK behavior was checked locally and
+with fakes. Configure remote server tracing separately to keep prompt traces off.

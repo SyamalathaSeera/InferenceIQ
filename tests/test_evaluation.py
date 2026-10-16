@@ -59,8 +59,8 @@ class FakeLangSmithClient:
 
     async def aevaluate(self, target, **kwargs):
         self.evaluation = kwargs
-        output = await target({"messages": [{"role": "user", "content": "Hello"}]})
-        assert "output" in output
+        output = await target(self.examples[0]["inputs"])
+        assert "quality_score" in output
         return {"experiment": "created"}
 
 
@@ -80,5 +80,7 @@ def test_langsmith_runner_creates_dataset_and_experiment() -> None:
 
     assert result == {"experiment": "created"}
     assert len(client.examples) == 2
-    assert client.evaluation["metadata"]["models"] == ["mock/fast"]
-    assert len(client.evaluation["evaluators"]) == 3
+    assert client.evaluation["metadata"]["content_recorded"] is False
+    assert "model_hash" in client.evaluation["metadata"]
+    assert len(client.evaluation["evaluators"]) == 1
+    assert "messages" not in client.examples[0]["inputs"]

@@ -1,0 +1,10 @@
+{
+  "version": "mock-price-v1",
+  "source": "Illustrative InferenceIQ development catalog; not real-provider pricing.",
+  "simulated": true,
+  "models": {
+    "mock/fast": {"input_cost_per_million": 0.1, "output_cost_per_million": 0.2},
+    "mock/balanced": {"input_cost_per_million": 0.5, "output_cost_per_million": 1.5},
+    "mock/quality": {"input_cost_per_million": 3, "output_cost_per_million": 12}
+  }
+}
