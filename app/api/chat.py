@@ -88,6 +88,7 @@ async def create_chat_completion(
     health = await load_model_health(
         session,
         cooldown_seconds=settings.circuit_cooldown_seconds,
+        now=request.app.state.health_clock(),
     )
     try:
         decision = decision_engine.decide(
@@ -135,6 +136,7 @@ async def create_chat_completion(
                 ],
                 failure_threshold=settings.circuit_failure_threshold,
                 ewma_alpha=settings.health_ewma_alpha,
+                now=request.app.state.health_clock(),
             )
             raise HTTPException(
                 status_code=400,
@@ -168,6 +170,7 @@ async def create_chat_completion(
                     ],
                     failure_threshold=settings.circuit_failure_threshold,
                     ewma_alpha=settings.health_ewma_alpha,
+                    now=request.app.state.health_clock(),
                 )
                 raise
             await record_provider_attempts(
@@ -182,6 +185,7 @@ async def create_chat_completion(
                 ],
                 failure_threshold=settings.circuit_failure_threshold,
                 ewma_alpha=settings.health_ewma_alpha,
+                now=request.app.state.health_clock(),
             )
             yield "data: [DONE]\n\n"
 
@@ -204,12 +208,17 @@ async def create_chat_completion(
         latency_ms: float,
         error_category: str | None,
     ) -> None:
+        latency_observer = getattr(request.app.state, "health_latency_ms", None)
         attempts.append(
             ProviderAttempt(
                 model_id=model_id,
                 provider=provider,
                 success=success,
-                latency_ms=latency_ms,
+                latency_ms=(
+                    latency_observer(model_id, latency_ms)
+                    if latency_observer
+                    else latency_ms
+                ),
                 error_category=error_category,
             )
         )
@@ -226,6 +235,7 @@ async def create_chat_completion(
             attempts,
             failure_threshold=settings.circuit_failure_threshold,
             ewma_alpha=settings.health_ewma_alpha,
+            now=request.app.state.health_clock(),
         )
         trace_id = await observer.record_inference(
             request_fingerprint=request_fingerprint(effective_body),
@@ -254,6 +264,7 @@ async def create_chat_completion(
             attempts,
             failure_threshold=settings.circuit_failure_threshold,
             ewma_alpha=settings.health_ewma_alpha,
+            now=request.app.state.health_clock(),
         )
         await record_outcome_and_apply_guardrails(
             session,

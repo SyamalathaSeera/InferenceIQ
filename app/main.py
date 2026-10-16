@@ -1,6 +1,7 @@
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 # Checkpoints contain only JSON-like workflow state. Keep deserialization restricted
@@ -23,6 +24,7 @@ from app.inference.catalog import create_model_catalog
 from app.inference.engine import InferenceDecisionEngine
 from app.observability import LangSmithObserver
 from app.operations import configure_operations
+from app.persistence.models import utc_now
 from app.policy.checkpoints import open_checkpointer
 from app.policy.workflow import create_policy_graph
 from app.providers.factory import create_providers
@@ -76,7 +78,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await database.close()
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    health_clock: Callable[[], datetime] = utc_now,
+) -> FastAPI:
     app = FastAPI(
         title="InferenceIQ",
         version="0.1.0",
@@ -85,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     settings = settings or get_settings()
     app.state.settings = settings
+    app.state.health_clock = health_clock
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
