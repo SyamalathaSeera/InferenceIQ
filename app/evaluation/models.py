@@ -40,3 +40,62 @@ class EvaluationReport(BaseModel):
     total_input_tokens: int
     total_output_tokens: int
     results: list[EvaluationCaseResult]
+
+
+class BenchmarkCaseResult(BaseModel):
+    arm: str
+    case_id: str
+    repetition: int
+    requested_model: str
+    selected_model: str | None = None
+    response_model: str | None = None
+    http_status: int | None = None
+    success: bool = False
+    error: str | None = None
+    latency_ms: float
+    gateway_attempts: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    input_cost_per_million: float | None = None
+    output_cost_per_million: float | None = None
+    completed_call_cost_usd: float | None = None
+    request_cost_usd: float | None = None
+    simulated: bool | None = None
+    quality_score: float | None = None
+    evaluator_scores: dict[str, float] = Field(default_factory=dict)
+
+
+class BenchmarkArmSummary(BaseModel):
+    arm: str
+    requests: int
+    successes: int
+    success_rate: float
+    p50_latency_ms: float
+    p95_latency_ms: float
+    successful_p50_latency_ms: float | None
+    successful_p95_latency_ms: float | None
+    average_quality_score: float | None
+    quality_scored_requests: int
+    quality_pass_rate: float
+    total_input_tokens: int | None
+    total_output_tokens: int | None
+    usage_known_requests: int
+    total_cost_usd: float | None
+    known_completed_call_cost_usd: float | None
+    cost_known_requests: int
+    simulated_requests: int
+    model_distribution: dict[str, int]
+
+
+class BenchmarkReport(BaseModel):
+    schema_version: int = 1
+    dataset_sha256: str
+    repetitions: int
+    concurrency: int
+    fixed_models: list[str]
+    generation_parameters: dict[str, float | int]
+    max_attempts: int
+    client_timeout_seconds: dict[str, float | None]
+    methodology: list[str]
+    arms: list[BenchmarkArmSummary]
+    results: list[BenchmarkCaseResult]

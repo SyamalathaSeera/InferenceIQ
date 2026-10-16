@@ -47,7 +47,9 @@ class LangChainOllamaProvider(ChatProvider):
         model_name = self._model_name(request.model)
         model = self._model_factory(model_name)
         try:
-            response: AIMessage = await model.ainvoke(self._messages(request))
+            response: AIMessage = await model.ainvoke(
+                self._messages(request), **self._generation_parameters(request)
+            )
         except Exception as exc:
             raise ProviderError(
                 "The Ollama request failed. Confirm that Ollama is running "
@@ -72,6 +74,11 @@ class LangChainOllamaProvider(ChatProvider):
                 total_tokens=usage.get("total_tokens", 0),
             ),
             provider=self.name,
+            metadata={
+                "usage_available": (
+                    "input_tokens" in usage and "output_tokens" in usage
+                )
+            },
         )
 
     async def stream(
@@ -114,6 +121,18 @@ class LangChainOllamaProvider(ChatProvider):
     def _model_name(self, requested_model: str | None) -> str:
         model = requested_model or self._default_model
         return model.removeprefix("ollama/")
+
+    @staticmethod
+    def _generation_parameters(request: ChatCompletionRequest) -> dict:
+        options = {
+            key: value
+            for key, value in {
+                "temperature": request.temperature,
+                "num_predict": request.max_tokens,
+            }.items()
+            if value is not None
+        }
+        return {"options": options} if options else {}
 
     @staticmethod
     def _messages(request: ChatCompletionRequest) -> list[BaseMessage]:

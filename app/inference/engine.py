@@ -172,8 +172,6 @@ class InferenceDecisionEngine:
                 provider=provider,
                 quality_score=0.5,
                 estimated_latency_ms=1000,
-                input_cost_per_million=0,
-                output_cost_per_million=0,
             )
         model_health = self._health_for(profile, health)
         if model_health.circuit_state == "open":

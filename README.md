@@ -64,6 +64,7 @@ npm run dev
 - [Deployment and operations](docs/DEPLOYMENT.md)
 - [Security model](docs/SECURITY.md)
 - [Learning and portfolio guide](docs/LEARNING_GUIDE.md)
+- [Reproducible routing benchmarks](docs/BENCHMARKS.md)
 
 ## Verification
 
